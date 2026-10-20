@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local-first AI</title>
+
+  <style>
+    body {
+      max-width: 800px;
+      margin: 32px auto;
+      padding: 0 16px;
+      font-family: system-ui, sans-serif;
+      background: #16181c;
+      color: #eee;
+    }
+
+    textarea,
+    button {
+      box-sizing: border-box;
+      font: inherit;
+      padding: 12px;
+    }
+
+    textarea {
+      width: 100%;
+    }
+
+    button {
+      margin-top: 12px;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      cursor: wait;
+      opacity: 0.6;
+    }
+
+    #messages {
+      margin: 24px 0;
+    }
+
+    .message {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      background: #252830;
+      padding: 16px;
+      margin: 12px 0;
+      border-radius: 8px;
+    }
+
+    #status {
+      color: #bbb;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Local-first AI</h1>
+
+  <p>
+    Completed exchanges are saved locally. The latest three exchanges
+    are supplied as model context. Explicit memory is currently
+    available through the API, not this page.
+  </p>
+
+  <div id="messages" aria-live="polite"></div>
+
+  <form id="chat-form">
+    <label for="message">Message</label>
+
+    <textarea
+      id="message"
+      rows="4"
+      maxlength="2000"
+      required
+      disabled
+    ></textarea>
+
+    <button id="send" type="submit" disabled>Send</button>
+  </form>
+
+  <p id="status" role="status"></p>
+
+  <script>
+    const form = document.getElementById("chat-form");
+    const input = document.getElementById("message");
+    const send = document.getElementById("send");
+    const messages = document.getElementById("messages");
+    const status = document.getElementById("status");
+
+    const storageKey = "local-first-ai.conversation-id";
+    let conversationId = null;
+
+    function addMessage(label, text) {
+      const entry = document.createElement("div");
+      entry.className = "message";
+      entry.textContent = `${label}\n\n${text}`;
+      messages.appendChild(entry);
+    }
+
+    async function api(url, options = {}) {
+      const response = await fetch(url, options);
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          typeof data.detail === "string"
+            ? data.detail
+            : `Request failed (${response.status}).`
+        );
+      }
+
+      return data;
+    }
+
+    async function initialize() {
+      status.textContent = "Loading conversation…";
+      input.disabled = true;
+      send.disabled = true;
+
+      try {
+        conversationId = localStorage.getItem(storageKey);
+
+        if (!conversationId) {
+          const data = await api("/conversations", {
+            method: "POST"
+          });
+
+          conversationId = data.conversation_id;
+          localStorage.setItem(storageKey, conversationId);
+        }
+
+        const data = await api(
+          `/conversations/${conversationId}`
+        );
+
+        for (const item of data.messages) {
+          addMessage(
+            item.role === "user" ? "You" : "Assistant",
+            item.content
+          );
+        }
+
+        status.textContent = "";
+        input.disabled = false;
+        send.disabled = false;
+        input.focus();
+      } catch (error) {
+        status.textContent = `Startup error: ${error.message}`;
+      }
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+
+      const message = input.value.trim();
+
+      if (!message || send.disabled) {
+        return;
+      }
+
+      send.disabled = true;
+      input.disabled = true;
+      status.textContent = "Generating…";
+
+      try {
+        const data = await api("/chat", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            conversation_id: conversationId,
+            message
+          })
+        });
+
+        if (typeof data.reply !== "string") {
+          throw new Error("Invalid application response.");
+        }
+
+        addMessage("You", message);
+        addMessage("Assistant", data.reply);
+
+        input.value = "";
+        status.textContent = "";
+      } catch (error) {
+        status.textContent = `Error: ${error.message}`;
+      } finally {
+        send.disabled = false;
+        input.disabled = false;
+        input.focus();
+      }
+    });
+
+    initialize();
+  </script>
+</body>
+</html>
