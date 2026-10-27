@@ -29,37 +29,142 @@ type Saved = {
   value: string;
   revision_id: number;
 };
-type ChatResult = {
+type StreamCompletion = {
   conversation_id: string;
   model: string;
-  reply: string;
   memory_used: MemoryRecord[];
+};
+type PendingMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  createdAt: Date;
+};
+type PendingExchange = {
+  user: PendingMessage;
+  assistant: PendingMessage;
+  status: "streaming" | "failed" | "confirmed";
 };
 const CONVERSATION_KEY = "local-first-ai.conversation-id";
 
+async function responseError(response: Response): Promise<Error> {
+  let detail = `Request failed (${response.status}).`;
+  try {
+    const body: unknown = await response.json();
+    if (typeof body === "object" && body !== null &&
+        "detail" in body && typeof body.detail === "string") {
+      detail = body.detail;
+    }
+  } catch { /* Proxy failures may return non-JSON content. */ }
+  return new Error(detail);
+}
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, options);
-  if (!response.ok) {
-    let detail = `Request failed (${response.status}).`;
-    try {
-      const body: unknown = await response.json();
-      if (typeof body === "object" && body !== null &&
-          "detail" in body && typeof body.detail === "string") {
-        detail = body.detail;
-      }
-    } catch { /* Proxy failures may return non-JSON content. */ }
-    throw new Error(detail);
-  }
+  if (!response.ok) throw await responseError(response);
   return (await response.json()) as T;
+}
+function isMemoryRecord(value: unknown): value is MemoryRecord {
+  return typeof value === "object" && value !== null &&
+    "id" in value && typeof value.id === "number" &&
+    "memory_key" in value && typeof value.memory_key === "string" &&
+    "value" in value && typeof value.value === "string" &&
+    "origin" in value && typeof value.origin === "string" &&
+    "confirmation_status" in value && typeof value.confirmation_status === "string" &&
+    "created_at" in value && typeof value.created_at === "string";
+}
+function isStreamCompletion(value: unknown): value is StreamCompletion {
+  return typeof value === "object" && value !== null &&
+    "conversation_id" in value && typeof value.conversation_id === "string" &&
+    "model" in value && typeof value.model === "string" &&
+    "memory_used" in value && Array.isArray(value.memory_used) && value.memory_used.every(isMemoryRecord);
+}
+function parseStreamFrame(frame: string): { event: string; data: unknown } | null {
+  let event = "message";
+  const data: string[] = [];
+  for (const line of frame.split(/\r?\n/)) {
+    if (!line || line.startsWith(":")) continue;
+    const separator = line.indexOf(":");
+    const field = separator < 0 ? line : line.slice(0, separator);
+    const value = separator < 0 ? "" : line.slice(separator + 1).replace(/^ /, "");
+    if (field === "event") event = value;
+    if (field === "data") data.push(value);
+  }
+  if (data.length === 0) return null;
+  return { event, data: JSON.parse(data.join("\n")) as unknown };
+}
+async function streamChat(
+  conversationId: string,
+  message: string,
+  memoryKey: string | null,
+  onText: (text: string) => void,
+): Promise<StreamCompletion> {
+  const controller = new AbortController();
+  const response = await fetch("/api/chat/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      conversation_id: conversationId,
+      message,
+      memory_key: memoryKey,
+    }),
+    signal: controller.signal,
+  });
+  if (!response.ok) throw await responseError(response);
+  if (!response.body) throw new Error("Streaming response body is unavailable.");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let completion: StreamCompletion | null = null;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      let separator = /\r?\n\r?\n/.exec(buffer);
+      while (separator) {
+        const frame = buffer.slice(0, separator.index);
+        buffer = buffer.slice(separator.index + separator[0].length);
+        const parsed = parseStreamFrame(frame);
+        if (parsed) {
+          if (parsed.event === "text" && typeof parsed.data === "object" && parsed.data !== null &&
+              "text" in parsed.data && typeof parsed.data.text === "string") {
+            onText(parsed.data.text);
+          } else if (parsed.event === "completion" && isStreamCompletion(parsed.data)) {
+            if (parsed.data.conversation_id !== conversationId) {
+              throw new Error("Completion confirmation was for a different conversation.");
+            }
+            completion = parsed.data;
+            controller.abort();
+            return completion;
+          } else if (parsed.event === "error" && typeof parsed.data === "object" && parsed.data !== null &&
+              "detail" in parsed.data && typeof parsed.data.detail === "string") {
+            throw new Error(parsed.data.detail);
+          } else {
+            throw new Error("The server sent an invalid chat stream event.");
+          }
+        }
+        separator = /\r?\n\r?\n/.exec(buffer);
+      }
+      if (done) break;
+    }
+    if (buffer.trim()) throw new Error("The chat stream ended with an incomplete event.");
+    if (!completion) throw new Error("Connection closed before the application confirmed the exchange was saved.");
+    return completion;
+  } catch (problem) {
+    controller.abort();
+    throw problem;
+  } finally {
+    reader.releaseLock();
+  }
 }
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
-function convertMessage(message: StoredMessage): ThreadMessageLike {
+function convertMessage(message: StoredMessage | PendingMessage): ThreadMessageLike {
   return {
     id: String(message.id), role: message.role,
     content: [{ type: "text", text: message.content }],
-    createdAt: new Date(message.created_at),
+    createdAt: "created_at" in message ? new Date(message.created_at) : message.createdAt,
   };
 }
 function RecordCard({ record }: { record: MemoryRecord }) {
@@ -218,12 +323,35 @@ function ChatSession({ conversationId, onBusyChange, selectedMemoryKey }: {
   selectedMemoryKey: string | null;
 }) {
   const [messages, setMessages] = useState<StoredMessage[]>([]);
+  const [pending, setPending] = useState<PendingExchange | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
   const [lastMemoryUsed, setLastMemoryUsed] = useState<MemoryRecord[] | null>(null);
   const requestInFlight = useRef(false);
+
+  const refreshHistory = useCallback(async () => {
+    if (requestInFlight.current) return;
+    requestInFlight.current = true;
+    setRefreshing(true);
+    onBusyChange(true);
+    try {
+      const data = await api<Conversation>(`/conversations/${conversationId}`);
+      setMessages(data.messages);
+      setPending(null);
+      setLoadFailed(false);
+      setError("");
+    } catch (problem) {
+      setError(`Could not refresh saved history: ${errorText(problem)}`);
+    } finally {
+      requestInFlight.current = false;
+      setRefreshing(false);
+      onBusyChange(false);
+    }
+  }, [conversationId, onBusyChange]);
+
   useEffect(() => {
     let active = true;
     async function load() {
@@ -242,50 +370,81 @@ function ChatSession({ conversationId, onBusyChange, selectedMemoryKey }: {
     void load();
     return () => { active = false; };
   }, [conversationId, onBusyChange]);
+
   const onNew = useCallback(async (message: AppendMessage) => {
     const text = message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n").trim();
-    if (!text || loading || loadFailed || requestInFlight.current) return;
+    if (!text || loading || loadFailed || pending || requestInFlight.current) return;
     if (text.length > 2000) { setError("Messages must be 2,000 characters or fewer."); return; }
     requestInFlight.current = true;
+    const id = crypto.randomUUID();
+    const createdAt = new Date();
+    setPending({
+      user: { id: `pending-user-${id}`, role: "user", content: text, createdAt },
+      assistant: { id: `pending-assistant-${id}`, role: "assistant", content: "", createdAt },
+      status: "streaming",
+    });
     setError("");
     setLastMemoryUsed(null);
     setRunning(true);
     onBusyChange(true);
     try {
-      const result = await api<ChatResult>("/chat", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          conversation_id: conversationId,
-          message: text,
-          memory_key: selectedMemoryKey,
-        }),
+      const completion = await streamChat(conversationId, text, selectedMemoryKey, (chunk) => {
+        setPending((current) => current ? {
+          ...current,
+          assistant: { ...current.assistant, content: current.assistant.content + chunk },
+        } : current);
       });
-      setLastMemoryUsed(result.memory_used);
-      const data = await api<Conversation>(`/conversations/${conversationId}`);
-      setMessages(data.messages);
+      setPending((current) => current ? { ...current, status: "confirmed" } : current);
+      setLastMemoryUsed(completion.memory_used);
+      try {
+        const data = await api<Conversation>(`/conversations/${conversationId}`);
+        setMessages(data.messages);
+        setPending(null);
+      } catch (problem) {
+        setError(`The application confirmed this exchange was saved, but saved history could not be refreshed: ${errorText(problem)}`);
+      }
     } catch (problem) {
-      setError(`${errorText(problem)} If the response was interrupted, refresh to check saved history before resending.`);
+      setPending((current) => current ? { ...current, status: "failed" } : current);
+      setError(errorText(problem));
     } finally {
       requestInFlight.current = false;
       setRunning(false);
       onBusyChange(false);
     }
-  }, [conversationId, loading, loadFailed, onBusyChange, selectedMemoryKey]);
+  }, [conversationId, loading, loadFailed, onBusyChange, pending, selectedMemoryKey]);
+
+  const displayMessages: (StoredMessage | PendingMessage)[] = pending
+    ? [...messages, pending.user, pending.assistant]
+    : messages;
   const runtime = useExternalStoreRuntime({
-    messages, convertMessage, isRunning: running,
-    isDisabled: loading || loadFailed, onNew,
+    messages: displayMessages,
+    convertMessage,
+    isRunning: running,
+    isDisabled: loading || loadFailed,
+    isSendDisabled: pending !== null,
+    onNew,
   });
-  const empty = messages.length === 0;
+  const empty = displayMessages.length === 0;
+  const needsHistoryRefresh = pending?.status === "failed" || pending?.status === "confirmed" || loadFailed;
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <ThreadPrimitive.Root className="thread">
-        {loading ? <div className="loading">Loading conversation…</div> : (
+        {loading ? <div className="loading">Loading conversation...</div> : (
           <ThreadPrimitive.Viewport className={`viewport ${empty ? "empty-viewport" : ""}`}>
             {empty && <div className="welcome"><h1>Where shall we begin?</h1><p>Your local space for thinking and continuity.</p></div>}
             <ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
             <ThreadPrimitive.ViewportFooter className="composer-footer">
-              {running && <p className="status" role="status">Generating locally…</p>}
+              {running && <p className="status" role="status">Generating locally. Pending messages are not saved yet.</p>}
               {error && <p className="error" role="alert">{error}</p>}
+              {pending?.status === "failed" && <p className="pending-notice" role="status">
+                This exchange was not confirmed as saved. Any generated text above is provisional, not canonical history. Refresh saved history before retrying.
+              </p>}
+              {pending?.status === "confirmed" && <p className="pending-notice" role="status">
+                The application confirmed the exchange was saved. Refresh saved history to reconcile the conversation before continuing.
+              </p>}
+              {needsHistoryRefresh && <button className="refresh-history" type="button" onClick={() => void refreshHistory()} disabled={refreshing}>
+                {refreshing ? "Refreshing saved history..." : "Refresh saved history before retrying"}
+              </button>}
               <div className="memory-chat-status">
                 <span>For next request: {selectedMemoryKey || "no selected memory"}</span>
                 {lastMemoryUsed !== null && <details className="memory-used">
@@ -303,6 +462,7 @@ function ChatSession({ conversationId, onBusyChange, selectedMemoryKey }: {
     </AssistantRuntimeProvider>
   );
 }
+
 export default function App() {
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [busy, setBusy] = useState(true);

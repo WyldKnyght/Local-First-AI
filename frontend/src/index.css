@@ -41,6 +41,9 @@ button:focus-visible, textarea:focus-visible, input:focus-visible { outline: 2px
 .send-button:hover:not(:disabled) { background: white; }
 .footnote { margin: 10px 12px 0; text-align: center; color: #8e877e; font-size: 11px; line-height: 1.6; }
 .status { color: #aaa197; font-size: 13px; padding: 0 8px; }
+.pending-notice { color: #f0d7a9; border: 1px solid #6b5939; border-radius: 10px; padding: 12px; background: #30291e; font-size: 13px; line-height: 1.6; }
+.refresh-history { margin: 0 8px 12px; padding: 9px 12px; border: 1px solid #6b5939; border-radius: 8px; color: inherit; background: #30291e; }
+.refresh-history:hover:not(:disabled) { background: #403522; }
 .error, .app-error { color: #f0b7a9; border: 1px solid #6b4339; border-radius: 10px; padding: 12px; background: #33211e; font-size: 13px; line-height: 1.6; }
 .app-error { margin: 10px 24px; }
 .loading { margin: auto; padding: 24px; color: #aaa197; }
