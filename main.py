@@ -2,6 +2,9 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID
@@ -74,6 +77,86 @@ class ChatRequest(BaseModel):
     conversation_id: UUID
     message: str = Field(min_length=1, max_length=2000)
     memory_key: str | None = Field(default=None, max_length=64)
+
+
+class StreamChatRequest(ChatRequest):
+    request_id: UUID
+
+
+@dataclass
+class StreamRequestState:
+    request_id: str
+    cancel_event: asyncio.Event
+    completion: asyncio.Future
+    decision_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    phase: str = "registered"
+    cancel_requested: bool = False
+    outcome: dict | None = None
+
+
+class StreamRequestRegistry:
+    TERMINAL_TTL_SECONDS = 300
+    MAX_TERMINAL_OUTCOMES = 256
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._active: dict[str, StreamRequestState] = {}
+        self._terminal: OrderedDict[str, tuple[float, dict]] = OrderedDict()
+
+    def _prune(self):
+        now = time.monotonic()
+        expired = [
+            request_id
+            for request_id, (expires_at, _) in self._terminal.items()
+            if expires_at <= now
+        ]
+        for request_id in expired:
+            self._terminal.pop(request_id, None)
+        while len(self._terminal) > self.MAX_TERMINAL_OUTCOMES:
+            self._terminal.popitem(last=False)
+
+    async def register(self, request_id: str) -> StreamRequestState:
+        async with self._lock:
+            self._prune()
+            if request_id in self._active or request_id in self._terminal:
+                raise HTTPException(status_code=409, detail="Stream request ID already used.")
+            state = StreamRequestState(
+                request_id=request_id,
+                cancel_event=asyncio.Event(),
+                completion=asyncio.get_running_loop().create_future(),
+            )
+            self._active[request_id] = state
+            return state
+
+    async def lookup(self, request_id: str):
+        async with self._lock:
+            self._prune()
+            state = self._active.get(request_id)
+            if state is not None:
+                return state
+            terminal = self._terminal.get(request_id)
+            return terminal[1] if terminal is not None else None
+
+    async def finish(self, state: StreamRequestState, outcome: dict):
+        async with self._lock:
+            if state.outcome is not None:
+                return state.outcome
+            state.outcome = {"request_id": state.request_id, **outcome}
+            state.phase = "terminal"
+            self._active.pop(state.request_id, None)
+            self._terminal[state.request_id] = (
+                time.monotonic() + self.TERMINAL_TTL_SECONDS,
+                state.outcome,
+            )
+            self._terminal.move_to_end(state.request_id)
+            self._prune()
+            if not state.completion.done():
+                state.completion.set_result(state.outcome)
+            return state.outcome
+
+
+stream_requests = StreamRequestRegistry()
+CANCEL_ACK_TIMEOUT_SECONDS = 5.0
 
 
 @app.get("/")
@@ -258,85 +341,217 @@ def stream_event(event: str, data: dict) -> str:
     )
 
 
+async def wait_for_ollama_line(lines, cancel_event: asyncio.Event):
+    line_task = asyncio.create_task(anext(lines))
+    cancel_task = asyncio.create_task(cancel_event.wait())
+    try:
+        await asyncio.wait(
+            (line_task, cancel_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if cancel_event.is_set():
+            raise ExplicitStreamCancellation
+        try:
+            return line_task.result()
+        except StopAsyncIteration:
+            return None
+    finally:
+        for task in (line_task, cancel_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(line_task, cancel_task, return_exceptions=True)
+
+
+class ExplicitStreamCancellation(Exception):
+    pass
+
+
+async def commit_stream_reply(state, conversation_id, message, reply, used_memory):
+    async with state.decision_lock:
+        if state.cancel_requested:
+            return {"status": "cancelled", "saved": False}
+        state.phase = "committing"
+        try:
+            storage.save_exchange(conversation_id, message, reply)
+        except sqlite3.Error:
+            outcome = {
+                "status": "save_error",
+                "saved": False,
+                "detail": (
+                    "The response could not be saved. "
+                    "Exchange not committed."
+                ),
+            }
+        else:
+            outcome = {
+                "status": "completed",
+                "saved": True,
+                "conversation_id": conversation_id,
+                "model": MODEL,
+                "memory_used": used_memory,
+            }
+        state.phase = "terminal"
+        return outcome
+
+
+def terminal_event(outcome: dict) -> tuple[str, dict] | None:
+    status = outcome["status"]
+    if status == "completed":
+        return "completion", outcome
+    if status == "cancelled":
+        return "cancelled", outcome
+    if status in {"inference_error", "transport_error", "save_error", "request_error"}:
+        return "error", outcome
+    return None
+
+
 @app.post("/chat/stream")
-async def chat_stream(request: ChatRequest):
+async def chat_stream(request: StreamChatRequest):
+    request_id = str(request.request_id)
+    state = await stream_requests.register(request_id)
+
     async def events():
-        async with chat_lock:
-            try:
-                cid, message, used_memory, payload = prepare_chat(
-                    request,
-                    stream=True,
-                )
-                reply_parts = []
-                done = False
+        outcome = None
+        disconnected = False
+        try:
+            async with chat_lock:
+                if state.cancel_event.is_set():
+                    outcome = {"status": "cancelled", "saved": False}
+                else:
+                    state.phase = "preparing"
+                    try:
+                        cid, message, used_memory, payload = prepare_chat(
+                            request,
+                            stream=True,
+                        )
+                        state.phase = "streaming"
+                        reply_parts = []
+                        done = False
+                        async with httpx.AsyncClient(
+                            timeout=httpx.Timeout(120.0, connect=5.0),
+                            trust_env=False,
+                        ) as client:
+                            async with client.stream(
+                                "POST",
+                                OLLAMA_URL,
+                                json=payload,
+                            ) as response:
+                                response.raise_for_status()
+                                lines = response.aiter_lines()
+                                while True:
+                                    line = await wait_for_ollama_line(
+                                        lines,
+                                        state.cancel_event,
+                                    )
+                                    if line is None:
+                                        break
+                                    if not line:
+                                        continue
+                                    data = json.loads(line)
+                                    if not isinstance(data, dict):
+                                        raise ValueError("Invalid response event.")
+                                    message_data = data.get("message", {})
+                                    if not isinstance(message_data, dict):
+                                        raise ValueError("Invalid response message.")
+                                    chunk = message_data.get("content", "")
+                                    if not isinstance(chunk, str):
+                                        raise ValueError("Invalid response content.")
+                                    if chunk:
+                                        reply_parts.append(chunk)
+                                        yield stream_event("text", {
+                                            "request_id": request_id,
+                                            "text": chunk,
+                                        })
+                                    if data.get("done") is True:
+                                        done = True
+                                        break
 
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(120.0, connect=5.0),
-                    trust_env=False,
-                ) as client:
-                    async with client.stream(
-                        "POST",
-                        OLLAMA_URL,
-                        json=payload,
-                    ) as response:
-                        response.raise_for_status()
+                        if state.cancel_event.is_set():
+                            outcome = {"status": "cancelled", "saved": False}
+                        else:
+                            reply = "".join(reply_parts)
+                            if not done or not reply.strip():
+                                raise ValueError("Incomplete response.")
 
-                        async for line in response.aiter_lines():
-                            if not line:
-                                continue
+                            outcome = await commit_stream_reply(
+                                state,
+                                cid,
+                                message,
+                                reply,
+                                used_memory,
+                            )
+                    except ExplicitStreamCancellation:
+                        outcome = {"status": "cancelled", "saved": False}
+                    except HTTPException as error:
+                        outcome = {
+                            "status": "request_error",
+                            "saved": False,
+                            "detail": error.detail,
+                        }
+                    except httpx.TimeoutException:
+                        outcome = {
+                            "status": "inference_error",
+                            "saved": False,
+                            "detail": "Ollama timed out.",
+                        }
+                    except httpx.HTTPError:
+                        outcome = {
+                            "status": "transport_error",
+                            "saved": False,
+                            "detail": "Ollama request failed.",
+                        }
+                    except (ValueError, KeyError, TypeError):
+                        outcome = {
+                            "status": "inference_error",
+                            "saved": False,
+                            "detail": "Ollama returned an invalid or incomplete response.",
+                        }
+                    except Exception:
+                        logger.exception("Unexpected error while streaming chat response")
+                        outcome = {
+                            "status": "inference_error",
+                            "saved": False,
+                            "detail": "An unexpected error interrupted the chat response.",
+                        }
+        except asyncio.CancelledError:
+            disconnected = True
+            if outcome is None:
+                async with state.decision_lock:
+                    if state.cancel_requested:
+                        outcome = {"status": "cancelled", "saved": False}
+                    else:
+                        outcome = {
+                            "status": "disconnected",
+                            "saved": False,
+                            "detail": "The browser connection ended before a terminal response.",
+                        }
+            raise
+        except GeneratorExit:
+            disconnected = True
+            if outcome is None:
+                async with state.decision_lock:
+                    if state.cancel_requested:
+                        outcome = {"status": "cancelled", "saved": False}
+                    else:
+                        outcome = {
+                            "status": "disconnected",
+                            "saved": False,
+                            "detail": "The browser connection ended before a terminal response.",
+                        }
+            raise
+        finally:
+            if outcome is None:
+                outcome = {
+                    "status": "inference_error",
+                    "saved": False,
+                    "detail": "The stream ended without a terminal outcome.",
+                }
+            outcome = await stream_requests.finish(state, outcome)
 
-                            data = json.loads(line)
-                            if not isinstance(data, dict):
-                                raise ValueError("Invalid response event.")
-
-                            message_data = data.get("message", {})
-                            if not isinstance(message_data, dict):
-                                raise ValueError("Invalid response message.")
-                            chunk = message_data.get("content", "")
-                            if not isinstance(chunk, str):
-                                raise ValueError("Invalid response content.")
-
-                            if chunk:
-                                reply_parts.append(chunk)
-                                yield stream_event("text", {"text": chunk})
-
-                            if data.get("done") is True:
-                                done = True
-                                break
-
-                reply = "".join(reply_parts)
-                if not done or not reply.strip():
-                    raise ValueError("Incomplete response.")
-
-                storage.save_exchange(cid, message, reply)
-                yield stream_event("completion", {
-                    "conversation_id": cid,
-                    "model": MODEL,
-                    "memory_used": used_memory,
-                })
-
-            except HTTPException as error:
-                yield stream_event("error", {"detail": error.detail})
-            except httpx.TimeoutException:
-                yield stream_event("error", {"detail": "Ollama timed out."})
-            except httpx.HTTPError:
-                yield stream_event("error", {"detail": "Ollama request failed."})
-            except sqlite3.Error:
-                yield stream_event("error", {
-                    "detail": (
-                        "The response could not be saved. "
-                        "Exchange not committed."
-                    )
-                })
-            except (ValueError, KeyError, TypeError):
-                yield stream_event("error", {
-                    "detail": "Ollama returned an invalid or incomplete response."
-                })
-            except Exception:
-                logger.exception("Unexpected error while streaming chat response")
-                yield stream_event("error", {
-                    "detail": "An unexpected error interrupted the chat response."
-                })
+        if not disconnected:
+            event = terminal_event(outcome)
+            if event is not None:
+                yield stream_event(event[0], event[1])
 
     return StreamingResponse(
         events(),
@@ -346,3 +561,49 @@ async def chat_stream(request: ChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post("/chat/stream/{request_id}/cancel")
+async def cancel_chat_stream(request_id: UUID):
+    request_key = str(request_id)
+    state_or_outcome = await stream_requests.lookup(request_key)
+    if state_or_outcome is None:
+        return {"request_id": request_key, "status": "unknown"}
+    if isinstance(state_or_outcome, dict):
+        return state_or_outcome
+
+    state = state_or_outcome
+    async with state.decision_lock:
+        if state.outcome is not None:
+            return state.outcome
+        if state.phase != "committing" and state.phase != "terminal":
+            state.cancel_requested = True
+            state.cancel_event.set()
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(state.completion),
+            timeout=CANCEL_ACK_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "request_id": request_key,
+            "status": "pending",
+            "cancellation_requested": state.cancel_requested,
+        }
+
+
+@app.get("/chat/stream/{request_id}/status")
+async def chat_stream_status(request_id: UUID):
+    request_key = str(request_id)
+    state_or_outcome = await stream_requests.lookup(request_key)
+    if state_or_outcome is None:
+        return {"request_id": request_key, "status": "unknown"}
+    if isinstance(state_or_outcome, dict):
+        return state_or_outcome
+    state = state_or_outcome
+    return {
+        "request_id": request_key,
+        "status": "cancelling" if state.cancel_requested else "active",
+        "cancellation_requested": state.cancel_requested,
+    }

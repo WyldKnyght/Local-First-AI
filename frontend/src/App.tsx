@@ -29,21 +29,36 @@ type Saved = {
   value: string;
   revision_id: number;
 };
-type StreamCompletion = {
-  conversation_id: string;
-  model: string;
-  memory_used: MemoryRecord[];
+type StreamOutcome = {
+  request_id: string;
+  status: "completed" | "cancelled" | "inference_error" | "transport_error" |
+    "save_error" | "request_error" | "disconnected" | "active" | "cancelling" |
+    "pending" | "unknown";
+  saved?: boolean;
+  conversation_id?: string;
+  model?: string;
+  memory_used?: MemoryRecord[];
+  detail?: string;
+  cancellation_requested?: boolean;
+};
+type ActiveStream = {
+  requestId: string;
+  controller: AbortController;
+  exchange: PendingExchange;
+  terminalHandled: boolean;
+  registered: boolean;
 };
 type PendingMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
   createdAt: Date;
+  displayLabel?: string;
 };
 type PendingExchange = {
   user: PendingMessage;
   assistant: PendingMessage;
-  status: "streaming" | "failed" | "confirmed";
+  status: "streaming" | "stopping" | "unknown" | "failed" | "confirmed" | "cancelled";
 };
 const CONVERSATION_KEY = "local-first-ai.conversation-id";
 
@@ -72,12 +87,6 @@ function isMemoryRecord(value: unknown): value is MemoryRecord {
     "confirmation_status" in value && typeof value.confirmation_status === "string" &&
     "created_at" in value && typeof value.created_at === "string";
 }
-function isStreamCompletion(value: unknown): value is StreamCompletion {
-  return typeof value === "object" && value !== null &&
-    "conversation_id" in value && typeof value.conversation_id === "string" &&
-    "model" in value && typeof value.model === "string" &&
-    "memory_used" in value && Array.isArray(value.memory_used) && value.memory_used.every(isMemoryRecord);
-}
 function parseStreamFrame(frame: string): { event: string; data: unknown } | null {
   let event = "message";
   const data: string[] = [];
@@ -92,30 +101,65 @@ function parseStreamFrame(frame: string): { event: string; data: unknown } | nul
   if (data.length === 0) return null;
   return { event, data: JSON.parse(data.join("\n")) as unknown };
 }
+function isStreamOutcome(value: unknown): value is StreamOutcome {
+  if (typeof value !== "object" || value === null ||
+      !("request_id" in value) || typeof value.request_id !== "string" ||
+      !("status" in value) || typeof value.status !== "string") return false;
+  const statuses = ["completed", "cancelled", "inference_error", "transport_error",
+    "save_error", "request_error", "disconnected", "active", "cancelling", "pending", "unknown"];
+  if (!statuses.includes(value.status)) return false;
+  return !("memory_used" in value) || (Array.isArray(value.memory_used) && value.memory_used.every(isMemoryRecord));
+}
+function isTerminalOutcome(outcome: StreamOutcome): boolean {
+  return ["completed", "cancelled", "inference_error", "transport_error", "save_error", "request_error", "disconnected"]
+    .includes(outcome.status);
+}
+async function boundedJsonRequest(path: string, options: RequestInit = {}): Promise<StreamOutcome> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 7000);
+  try {
+    const response = await fetch(`/api${path}`, { ...options, signal: controller.signal });
+    if (!response.ok) throw await responseError(response);
+    const body: unknown = await response.json();
+    if (!isStreamOutcome(body)) throw new Error("The server returned an invalid request status.");
+    return body;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+async function requestCancellation(requestId: string): Promise<StreamOutcome> {
+  return boundedJsonRequest(`/chat/stream/${requestId}/cancel`, { method: "POST" });
+}
+async function requestStreamStatus(requestId: string): Promise<StreamOutcome> {
+  return boundedJsonRequest(`/chat/stream/${requestId}/status`);
+}
 async function streamChat(
   conversationId: string,
+  requestId: string,
   message: string,
   memoryKey: string | null,
+  controller: AbortController,
+  onRegistered: () => void,
   onText: (text: string) => void,
-): Promise<StreamCompletion> {
-  const controller = new AbortController();
+): Promise<StreamOutcome> {
   const response = await fetch("/api/chat/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       conversation_id: conversationId,
+      request_id: requestId,
       message,
       memory_key: memoryKey,
     }),
     signal: controller.signal,
   });
   if (!response.ok) throw await responseError(response);
-  if (!response.body) throw new Error("Streaming response body is unavailable.");
+  onRegistered();
+  if (!response.body) throw new Error("Streaming response body is unavailable; request outcome is unknown.");
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  let completion: StreamCompletion | null = null;
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -127,32 +171,28 @@ async function streamChat(
         const parsed = parseStreamFrame(frame);
         if (parsed) {
           if (parsed.event === "text" && typeof parsed.data === "object" && parsed.data !== null &&
+              "request_id" in parsed.data && parsed.data.request_id === requestId &&
               "text" in parsed.data && typeof parsed.data.text === "string") {
             onText(parsed.data.text);
-          } else if (parsed.event === "completion" && isStreamCompletion(parsed.data)) {
-            if (parsed.data.conversation_id !== conversationId) {
-              throw new Error("Completion confirmation was for a different conversation.");
+          } else if (["completion", "cancelled", "error"].includes(parsed.event) && isStreamOutcome(parsed.data)) {
+            if (parsed.data.request_id !== requestId || !isTerminalOutcome(parsed.data)) {
+              throw new Error("The server sent an invalid terminal chat event; request outcome is unknown.");
             }
-            completion = parsed.data;
-            controller.abort();
-            return completion;
-          } else if (parsed.event === "error" && typeof parsed.data === "object" && parsed.data !== null &&
-              "detail" in parsed.data && typeof parsed.data.detail === "string") {
-            throw new Error(parsed.data.detail);
+            if (parsed.event === "completion" && parsed.data.status !== "completed" ||
+                parsed.event === "cancelled" && parsed.data.status !== "cancelled" ||
+                parsed.event === "error" && !["inference_error", "transport_error", "save_error", "request_error"].includes(parsed.data.status)) {
+              throw new Error("The server sent an inconsistent terminal chat event; request outcome is unknown.");
+            }
+            return parsed.data;
           } else {
-            throw new Error("The server sent an invalid chat stream event.");
+            throw new Error("The server sent an invalid chat stream event; request outcome is unknown.");
           }
         }
         separator = /\r?\n\r?\n/.exec(buffer);
       }
       if (done) break;
     }
-    if (buffer.trim()) throw new Error("The chat stream ended with an incomplete event.");
-    if (!completion) throw new Error("Connection closed before the application confirmed the exchange was saved.");
-    return completion;
-  } catch (problem) {
-    controller.abort();
-    throw problem;
+    throw new Error("Connection closed without a terminal request outcome.");
   } finally {
     reader.releaseLock();
   }
@@ -161,9 +201,12 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 function convertMessage(message: StoredMessage | PendingMessage): ThreadMessageLike {
+  const content = "displayLabel" in message && message.displayLabel
+    ? `${message.displayLabel}\n\n${message.content}`
+    : message.content;
   return {
     id: String(message.id), role: message.role,
-    content: [{ type: "text", text: message.content }],
+    content: [{ type: "text", text: content }],
     createdAt: "created_at" in message ? new Date(message.created_at) : message.createdAt,
   };
 }
@@ -324,13 +367,76 @@ function ChatSession({ conversationId, onBusyChange, selectedMemoryKey }: {
 }) {
   const [messages, setMessages] = useState<StoredMessage[]>([]);
   const [pending, setPending] = useState<PendingExchange | null>(null);
+  const [cancelledExchanges, setCancelledExchanges] = useState<PendingExchange[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
   const [running, setRunning] = useState(false);
+  const [streamRegistered, setStreamRegistered] = useState(false);
   const [error, setError] = useState("");
   const [lastMemoryUsed, setLastMemoryUsed] = useState<MemoryRecord[] | null>(null);
+  const activeStream = useRef<ActiveStream | null>(null);
   const requestInFlight = useRef(false);
+
+  const reconcileHistory = useCallback(async () => {
+    const data = await api<Conversation>(`/conversations/${conversationId}`);
+    setMessages(data.messages);
+    setLoadFailed(false);
+  }, [conversationId]);
+
+  const applyTerminalOutcome = useCallback(async (session: ActiveStream, outcome: StreamOutcome) => {
+    if (outcome.request_id !== session.requestId || !isTerminalOutcome(outcome) || session.terminalHandled) return;
+    session.terminalHandled = true;
+    setRunning(false);
+    setStreamRegistered(false);
+    if (outcome.status === "cancelled") {
+      try {
+        await reconcileHistory();
+        setCancelledExchanges((current) => [...current, {
+          ...session.exchange,
+          assistant: { ...session.exchange.assistant, displayLabel: "Cancelled - unsaved partial output" },
+          status: "cancelled",
+        }]);
+        setPending((current) => current?.user.id === session.exchange.user.id ? null : current);
+        setError("Cancelled and not saved. Ollama may continue computing after its connection is closed.");
+      } catch (problem) {
+        setPending({
+          ...session.exchange,
+          assistant: { ...session.exchange.assistant, displayLabel: "Cancelled - unsaved partial output" },
+          status: "cancelled",
+        });
+        setError(`Cancellation was acknowledged, but saved history could not be reconciled: ${errorText(problem)}`);
+      }
+    } else if (outcome.status === "completed" && outcome.saved === true) {
+      setPending({ ...session.exchange, status: "confirmed" });
+      setLastMemoryUsed(outcome.memory_used ?? []);
+      try {
+        await reconcileHistory();
+        setPending((current) => current?.user.id === session.exchange.user.id ? null : current);
+        setError("");
+      } catch (problem) {
+        setError(`The exchange was confirmed saved, but saved history could not be refreshed: ${errorText(problem)}`);
+      }
+    } else {
+      const descriptions: Record<string, string> = {
+        inference_error: "Model inference failed.",
+        transport_error: "Connection to Ollama failed.",
+        save_error: "The response could not be saved; the exchange was not committed.",
+        request_error: outcome.detail ?? "The chat request was rejected.",
+        disconnected: "The browser connection ended without application cancellation.",
+      };
+      setPending({ ...session.exchange, status: "failed" });
+      setError(`${descriptions[outcome.status] ?? "The request failed."} ${outcome.detail ?? ""}`.trim());
+      try {
+        await reconcileHistory();
+      } catch (problem) {
+        setError(`${errorText(problem)} Saved history could not be reconciled.`);
+      }
+    }
+    if (activeStream.current === session) activeStream.current = null;
+    requestInFlight.current = false;
+    onBusyChange(false);
+  }, [onBusyChange, reconcileHistory]);
 
   const refreshHistory = useCallback(async () => {
     if (requestInFlight.current) return;
@@ -338,10 +444,17 @@ function ChatSession({ conversationId, onBusyChange, selectedMemoryKey }: {
     setRefreshing(true);
     onBusyChange(true);
     try {
-      const data = await api<Conversation>(`/conversations/${conversationId}`);
-      setMessages(data.messages);
-      setPending(null);
-      setLoadFailed(false);
+      await reconcileHistory();
+      if (pending?.status === "cancelled") {
+        setCancelledExchanges((current) => [...current, {
+          ...pending,
+          assistant: { ...pending.assistant, displayLabel: "Cancelled - unsaved partial output" },
+          status: "cancelled",
+        }]);
+        setPending(null);
+      } else if (pending?.status === "confirmed" || pending?.status === "failed") {
+        setPending(null);
+      }
       setError("");
     } catch (problem) {
       setError(`Could not refresh saved history: ${errorText(problem)}`);
@@ -350,7 +463,57 @@ function ChatSession({ conversationId, onBusyChange, selectedMemoryKey }: {
       setRefreshing(false);
       onBusyChange(false);
     }
-  }, [conversationId, onBusyChange]);
+  }, [onBusyChange, pending, reconcileHistory]);
+
+  const checkRequestStatus = useCallback(async () => {
+    const session = activeStream.current;
+    if (!session) return;
+    setError("");
+    try {
+      const outcome = await requestStreamStatus(session.requestId);
+      if (session.terminalHandled) return;
+      if (isTerminalOutcome(outcome)) {
+        await applyTerminalOutcome(session, outcome);
+        session.controller.abort();
+      } else if (outcome.status === "unknown") {
+        setPending({ ...session.exchange, status: "unknown" });
+        setError("The backend no longer has this request's outcome. Do not retry until its result can be established.");
+        onBusyChange(true);
+      } else {
+        setStreamRegistered(outcome.status === "active" || outcome.status === "cancelling");
+        setPending({ ...session.exchange, status: "unknown" });
+        setError("The request is still active or stopping. Check its status again before retrying.");
+        onBusyChange(true);
+      }
+    } catch (problem) {
+      if (session.terminalHandled) return;
+      setPending({ ...session.exchange, status: "unknown" });
+      setError(`Request outcome is unknown; status lookup failed: ${errorText(problem)}`);
+      onBusyChange(true);
+    }
+  }, [applyTerminalOutcome, onBusyChange]);
+
+  const stopRequest = useCallback(async () => {
+    const session = activeStream.current;
+    if (!session || session.terminalHandled) return;
+    setPending({ ...session.exchange, status: "stopping" });
+    setError("");
+    try {
+      const outcome = await requestCancellation(session.requestId);
+      if (session.terminalHandled) return;
+      if (isTerminalOutcome(outcome)) {
+        await applyTerminalOutcome(session, outcome);
+        session.controller.abort();
+      } else {
+        setPending({ ...session.exchange, status: "unknown" });
+        setError("Cancellation is not yet acknowledged. The request outcome is unknown; check status before retrying.");
+      }
+    } catch (problem) {
+      if (session.terminalHandled) return;
+      setPending({ ...session.exchange, status: "unknown" });
+      setError(`Cancellation acknowledgment was not received. The request outcome is unknown: ${errorText(problem)}`);
+    }
+  }, [applyTerminalOutcome]);
 
   useEffect(() => {
     let active = true;
@@ -376,46 +539,59 @@ function ChatSession({ conversationId, onBusyChange, selectedMemoryKey }: {
     if (!text || loading || loadFailed || pending || requestInFlight.current) return;
     if (text.length > 2000) { setError("Messages must be 2,000 characters or fewer."); return; }
     requestInFlight.current = true;
-    const id = crypto.randomUUID();
-    const createdAt = new Date();
-    setPending({
-      user: { id: `pending-user-${id}`, role: "user", content: text, createdAt },
-      assistant: { id: `pending-assistant-${id}`, role: "assistant", content: "", createdAt },
+    const requestId = crypto.randomUUID();
+    const exchange: PendingExchange = {
+      user: { id: `pending-user-${requestId}`, role: "user", content: text, createdAt: new Date() },
+      assistant: { id: `pending-assistant-${requestId}`, role: "assistant", content: "", createdAt: new Date() },
       status: "streaming",
-    });
+    };
+    const session: ActiveStream = {
+      requestId,
+      controller: new AbortController(),
+      exchange,
+      terminalHandled: false,
+      registered: false,
+    };
+    activeStream.current = session;
+    setPending(exchange);
     setError("");
     setLastMemoryUsed(null);
+    setStreamRegistered(false);
     setRunning(true);
     onBusyChange(true);
     try {
-      const completion = await streamChat(conversationId, text, selectedMemoryKey, (chunk) => {
-        setPending((current) => current ? {
-          ...current,
-          assistant: { ...current.assistant, content: current.assistant.content + chunk },
-        } : current);
+      const outcome = await streamChat(conversationId, requestId, text, selectedMemoryKey, session.controller, () => {
+        session.registered = true;
+        setStreamRegistered(true);
+      }, (chunk) => {
+        session.exchange = {
+          ...session.exchange,
+          assistant: { ...session.exchange.assistant, content: session.exchange.assistant.content + chunk },
+        };
+        setPending((current) => current?.user.id === session.exchange.user.id
+          ? { ...current, assistant: session.exchange.assistant }
+          : current);
       });
-      setPending((current) => current ? { ...current, status: "confirmed" } : current);
-      setLastMemoryUsed(completion.memory_used);
-      try {
-        const data = await api<Conversation>(`/conversations/${conversationId}`);
-        setMessages(data.messages);
-        setPending(null);
-      } catch (problem) {
-        setError(`The application confirmed this exchange was saved, but saved history could not be refreshed: ${errorText(problem)}`);
-      }
+      await applyTerminalOutcome(session, outcome);
     } catch (problem) {
-      setPending((current) => current ? { ...current, status: "failed" } : current);
-      setError(errorText(problem));
-    } finally {
-      requestInFlight.current = false;
-      setRunning(false);
-      onBusyChange(false);
+      if (!session.terminalHandled) {
+        setStreamRegistered(false);
+        setPending({ ...session.exchange, status: "unknown" });
+        setError(`Request outcome is unknown: ${errorText(problem)} Check backend status before retrying.`);
+        onBusyChange(true);
+      }
     }
-  }, [conversationId, loading, loadFailed, onBusyChange, pending, selectedMemoryKey]);
+  }, [applyTerminalOutcome, conversationId, loading, loadFailed, onBusyChange, pending, selectedMemoryKey]);
 
-  const displayMessages: (StoredMessage | PendingMessage)[] = pending
-    ? [...messages, pending.user, pending.assistant]
-    : messages;
+  const displayMessages: (StoredMessage | PendingMessage)[] = [
+    ...messages,
+    ...cancelledExchanges.flatMap((exchange) => [exchange.user, exchange.assistant]),
+    ...(pending ? [pending.user, pending.assistant] : []),
+  ].sort((left, right) => {
+    const leftTime = "created_at" in left ? Date.parse(left.created_at) : left.createdAt.getTime();
+    const rightTime = "created_at" in right ? Date.parse(right.created_at) : right.createdAt.getTime();
+    return leftTime - rightTime;
+  });
   const runtime = useExternalStoreRuntime({
     messages: displayMessages,
     convertMessage,
@@ -425,7 +601,9 @@ function ChatSession({ conversationId, onBusyChange, selectedMemoryKey }: {
     onNew,
   });
   const empty = displayMessages.length === 0;
-  const needsHistoryRefresh = pending?.status === "failed" || pending?.status === "confirmed" || loadFailed;
+  const needsHistoryRefresh = pending?.status === "failed" || pending?.status === "confirmed" ||
+    pending?.status === "cancelled" || loadFailed;
+  const needsStatusCheck = pending?.status === "unknown";
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <ThreadPrimitive.Root className="thread">
@@ -435,15 +613,25 @@ function ChatSession({ conversationId, onBusyChange, selectedMemoryKey }: {
             <ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
             <ThreadPrimitive.ViewportFooter className="composer-footer">
               {running && <p className="status" role="status">Generating locally. Pending messages are not saved yet.</p>}
+              {pending?.status === "stopping" && <p className="status" role="status">Stopping…</p>}
               {error && <p className="error" role="alert">{error}</p>}
+              {pending?.status === "cancelled" && <p className="pending-notice" role="status">
+                Cancelled and unsaved. Partial output is provisional and is not included in canonical history or future model context.
+              </p>}
               {pending?.status === "failed" && <p className="pending-notice" role="status">
-                This exchange was not confirmed as saved. Any generated text above is provisional, not canonical history. Refresh saved history before retrying.
+                The request failed. Any generated text above is provisional, not canonical history. Refresh saved history before retrying.
               </p>}
               {pending?.status === "confirmed" && <p className="pending-notice" role="status">
                 The application confirmed the exchange was saved. Refresh saved history to reconcile the conversation before continuing.
               </p>}
               {needsHistoryRefresh && <button className="refresh-history" type="button" onClick={() => void refreshHistory()} disabled={refreshing}>
                 {refreshing ? "Refreshing saved history..." : "Refresh saved history before retrying"}
+              </button>}
+              {needsStatusCheck && <button className="refresh-history" type="button" onClick={() => void checkRequestStatus()}>
+                Check request status
+              </button>}
+              {running && streamRegistered && <button className="stop-button" type="button" onClick={() => void stopRequest()}>
+                Stop
               </button>}
               <div className="memory-chat-status">
                 <span>For next request: {selectedMemoryKey || "no selected memory"}</span>
@@ -454,7 +642,7 @@ function ChatSession({ conversationId, onBusyChange, selectedMemoryKey }: {
                 </details>}
               </div>
               <Composer empty={empty} />
-              <p className="footnote">Completed exchanges are saved locally. Model context: latest three exchanges. No live web access.</p>
+              <p className="footnote">Completed exchanges are saved locally. Model context: latest three saved exchanges. No live web access.</p>
             </ThreadPrimitive.ViewportFooter>
           </ThreadPrimitive.Viewport>
         )}

@@ -27,7 +27,7 @@ out of scope.
 
 ## Local startup — current working setup
 
-Consult this section before asking Craig how to start the application.
+Consult this section for the current local startup procedure.
 
 Backend — separate terminal:
 
@@ -48,8 +48,8 @@ npm run dev -- --host 127.0.0.1
 Ollama must be running. The backend-configured model is `mistral:7b-instruct`,
 using the inference endpoint `http://127.0.0.1:11434/api/chat`.
 
-The frontend startup command was supplied directly by Craig. The backend startup
-command and model configuration were identified in the local code/documentation
+The frontend startup command was supplied by the user. The backend startup
+command and model configuration were identified in local code/documentation
 inspection; they were not newly runtime-tested during that inspection.
 
 If port 8000 is occupied, identify the existing server rather than starting a
@@ -83,9 +83,10 @@ alternating with localhost:5173.
 The Vite proxy is development-only. A production build is not yet wired to
 FastAPI; this archive does not complete production hosting.
 
-On interruption, refresh and check saved history before resending: the current
-backend has no idempotency key or cancellation protocol. Do not treat refresh as
-cancelling inference. Keep one browser tab for this first test.
+This was the original streaming-integration recovery guidance. Explicit
+request-scoped cancellation was added in the later cancellation increment below.
+Browser refresh or disconnect still does not guarantee inference stops. Keep one
+browser tab for the acceptance sequence.
 
 ## Failure/recovery validation — 2026-10-20
 
@@ -141,12 +142,15 @@ checkpoint, not completion of the full release plan.
 The compatible `POST /chat` endpoint remains non-streaming. The frontend uses
 `POST /chat/stream`, which emits server-sent events:
 
-- `text`: `{"text":"..."}` for each Ollama content fragment.
-- `completion`: `{"conversation_id":"...","model":"...","memory_used":[...]}`
-  only after Ollama reports a valid completed reply and `save_exchange()` commits
-  both messages.
-- `error`: `{"detail":"..."}` for validation, inference, stream, or save
-  failures. A stream ending without `completion` is never treated as success.
+- `text`: `{"request_id":"...","text":"..."}` for each Ollama content
+  fragment.
+- `completion`: includes the request ID, `status: "completed"`, and `saved: true`,
+  plus conversation/model/memory metadata, only after the paired transaction
+  commits.
+- `cancelled`: includes the request ID and `saved: false`, after resources and
+  the chat lock are released.
+- `error`: includes the request ID, a distinct request/inference/transport/save
+  status, and detail. A stream ending without a terminal event is not success.
 
 The UI shows the pending user message and generated text separately from saved
 history. Until completion confirmation, displayed text is provisional. On an
@@ -183,11 +187,121 @@ Limitations and interpretation:
   commentary, so exact-output instruction adherence did not pass.
 - Some longer answers ended mid-sentence. The retained `num_predict: 256` limit
   is a suspected explanation, not a verified diagnosis.
-- Explicit application cancellation remains unimplemented. Stopping Ollama was
-  an interruption test, not a cancellation-feature test.
+- Explicit application cancellation was not part of the October 27 validation;
+  stopping Ollama was an interruption test, not a cancellation-feature test.
 - This closes the tested streaming increment, not the full release plan.
 - A Git checkpoint protects source code, not the local database or application
   data.
+
+## Explicit cancellation behavior
+
+Each streamed request uses a fresh UUID. `POST /chat/stream/{request_id}/cancel`
+requests cancellation for that exact request, and
+`GET /chat/stream/{request_id}/status` provides a read-only outcome lookup.
+Cancellation and status responses are idempotent and terminal outcomes are
+retained in memory for up to five minutes (bounded to 256 outcomes). A timeout
+is pending/unknown, never proof of cancellation; the UI resolves status before
+allowing another send. Unknown request IDs do not target another request.
+
+Cancellation is serialized against the paired-message save. If cancellation
+wins, no exchange is saved; after the backend acknowledges cancellation and
+saved history has been refreshed, partial output remains visibly labelled
+cancelled and unsaved. That local display is not canonical history or future
+model context. If commit wins, the actual save result is reported instead.
+Ordinary inference, transport, and save errors are separate outcomes.
+
+Coordination is in-memory and single-process, matching the prototype's global
+chat lock. Backend restart loses active request and terminal outcome state; a
+status of unknown does not establish whether an exchange was saved. Closing the
+Ollama connection is best-effort interruption and does not guarantee Ollama
+stops computing. A browser/server disconnect is not the same as explicit user
+cancellation. No schema or dependency changes are required for this prototype
+protocol; multi-process deployment would require shared coordination and is
+out of scope.
+
+## Terminal SSE outcome fix - 2026-10-28
+
+Live cancellation testing exposed a terminal-event payload defect: the request
+registry stored and returned terminal outcomes enriched with `request_id`, but
+the SSE generator discarded that canonical value and emitted its unenriched
+local outcome. The frontend correctly requires `request_id`, so it rejected
+terminal SSE events even though the status endpoint could resolve them.
+
+The generator now emits the outcome returned by `finish()` after HTTPX cleanup
+and release of the global chat lock. Completion, cancellation, and error SSE
+payloads therefore match the repeatable request-ID status outcome. Frontend
+validation remains strict. Regression tests parse actual emitted SSE frames
+and compare their payloads with the originating request ID and status endpoint.
+
+Local validation on 2026-10-28:
+
+- `npm.cmd --prefix frontend run build` - passed; Vite reported a nonfatal
+  bundle-size warning (579.48 kB minified JavaScript chunk).
+- `npm.cmd --prefix frontend run lint` - passed.
+- `.\.venv\Scripts\python.exe -m unittest discover -s tests -v` - all 14
+  isolated backend tests passed.
+- `.\.venv\Scripts\python.exe -m py_compile main.py tests\test_chat_streaming.py`
+  - passed.
+- `git diff --check` - passed.
+
+These are local build, lint, isolated test, compilation, and whitespace checks.
+They do not constitute a live-browser retest of the terminal SSE correction;
+live retesting remains outstanding.
+
+## Explicit cancellation validation - 2026-10-28
+
+User-reported browser acceptance results, supported by the conversation; these
+were not tests newly performed while documenting this checkpoint:
+
+- The React frontend was tested at http://127.0.0.1:5173/.
+- Stop during a streamed counting response was acknowledged, and the UI
+  reported that the exchange was cancelled and not saved.
+- A subsequent request succeeded without restarting services.
+- The first cancellation attempt exposed the terminal SSE defect described
+  above: the frontend rejected the event because `request_id` was absent.
+  Clicking Check request status resolved that initial unknown outcome.
+- The defect was corrected by emitting the canonical outcome returned by
+  `finish()`.
+- After correction, the Stop -> recovery -> refresh sequence passed:
+  - Cancellation was acknowledged.
+  - The follow-up completed without a status lookup or invalid-stream-event
+    error.
+  - The completed `CANCEL RECOVERY OK` exchange remained after browser refresh.
+  - The user's final clarification was interpreted as confirming that the
+    cancelled counting exchange did not remain after refresh.
+- No direct database inspection was performed during browser validation.
+
+Evidence boundaries and limitations:
+
+- This was a browser acceptance sequence, not exhaustive cancellation testing.
+  Commit-versus-cancel decision races, save outcomes, cancellation while waiting
+  for the chat lock, duplicate requests/Stop, disconnect distinctions, and related
+  edge cases have isolated test coverage only where present in the backend suite;
+  they were not live-validated by this browser sequence. Lost acknowledgment was
+  not tested live.
+- Application cancellation closes the upstream HTTP connection but does not
+  guarantee Ollama stopped computing.
+- Coordination remains in-memory and single-process; a backend restart loses
+  active request and retained terminal outcome state.
+- Cancelled partial output is transient UI state, not canonical saved history or
+  future model context.
+- Blank-chat startup is not part of this checkpoint.
+- This checkpoint protects source code only; it is not a database backup or an
+  off-PC copy.
+
+Local checks run for this checkpoint documentation/commit:
+
+- `npm.cmd --prefix frontend run build` - passed; Vite reported a nonfatal
+  bundle-size warning for the 579.48 kB minified JavaScript chunk.
+- `npm.cmd --prefix frontend run lint` - passed.
+- `.\.venv\Scripts\python.exe -m unittest discover -s tests -v` - all 14
+  isolated backend tests passed.
+- `.\.venv\Scripts\python.exe -m py_compile main.py tests\test_chat_streaming.py`
+  - passed.
+- `git diff --check` - passed after the final documentation edit.
+
+These local checks are not new live browser tests. The browser results above are
+user-reported, and this section does not claim another live test pass.
 
 ## If anything fails
 
