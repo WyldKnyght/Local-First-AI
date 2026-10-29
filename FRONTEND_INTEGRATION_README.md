@@ -9,10 +9,10 @@ not been browser-tested; see the dated validation sections below for later
 results.
 
 Includes assistant-ui chat primitives, the external-store adapter, a
-Perplexity-style layout, saved conversation reload, New conversation, streamed
-chat responses, and explicit memory controls. Conversation list, search,
-attachments, voice, model selection, authentication, and LAN deployment remain
-out of scope.
+Perplexity-style layout, blank conversation startup, New conversation, streamed
+chat responses, and explicit memory controls. Saved conversations are retained,
+but conversation browsing/reopening, search, attachments, voice, model selection,
+authentication, and LAN deployment remain out of scope.
 
 ## Apply
 
@@ -68,17 +68,18 @@ Only continue if the package is installed and build/lint pass.
 
 ## Browser test
 
-Open http://127.0.0.1:5173/ and send a short message. Refresh and verify history.
-Then select New conversation and send another message.
+Open http://127.0.0.1:5173/; each fresh page load starts a blank conversation.
+To check a completed exchange in the current conversation, use its in-page
+Refresh saved history action. A browser refresh starts a different blank
+conversation, so it is no longer a visual persistence check for the previous
+conversation.
 
-New conversation creates another database record; it does not delete the old
-conversation. A conversation list is not included yet, so switching back through
-the UI is not available in this increment.
+New conversation also creates another database record without deleting the old
+one. Saved conversations are retained, but conversation browsing/reopening is not
+available through the UI yet. Durable memory remains available and no memory key
+is selected automatically on startup.
 
-Browser localStorage is origin-specific. The frontend at port 5173 will normally
-start a new conversation rather than reuse the old page's selection at port 8000.
-Old transcripts remain in SQLite. Use 127.0.0.1:5173 consistently rather than
-alternating with localhost:5173.
+Use 127.0.0.1:5173 consistently rather than alternating with localhost:5173.
 
 The Vite proxy is development-only. A production build is not yet wired to
 FastAPI; this archive does not complete production hosting.
@@ -285,7 +286,7 @@ Evidence boundaries and limitations:
   active request and retained terminal outcome state.
 - Cancelled partial output is transient UI state, not canonical saved history or
   future model context.
-- Blank-chat startup is not part of this checkpoint.
+- Blank-chat startup was outside the October 28 checkpoint scope.
 - This checkpoint protects source code only; it is not a database backup or an
   off-PC copy.
 
@@ -307,3 +308,46 @@ user-reported, and this section does not claim another live test pass.
 
 Paste the full build/lint error or browser error. Do not add cloud credentials,
 provider SDKs, CORS wildcards, or expose either server to the LAN as a workaround.
+
+## Blank-chat startup - 2026-10-29
+
+Every fresh page load, including browser refresh, creates and opens one new blank
+conversation. The startup request is created lazily from the React effect, not at
+module import time. A module-scoped promise shares that one request between
+StrictMode's repeated effect setup in the same page runtime; a genuine page reload
+starts a new JavaScript runtime and therefore a new conversation. Initialization
+failures are shown in the UI and are not silently retried by effect setup.
+
+Existing saved conversations and durable memory are not deleted or changed.
+Saved conversations cannot yet be browsed or reopened through the UI. No memory
+key is selected on startup. The in-page Refresh saved history action still loads
+the current conversation; it does not create a new one. Browser refresh creates a
+new conversation, and refreshing while a request is active is not equivalent to
+pressing Stop or receiving an acknowledged cancellation.
+
+
+## Blank-chat startup validation - 2026-10-29
+
+User-reported browser acceptance confirmed that a browser refresh opens a blank
+conversation, no memory key is selected on startup, normal message completion
+works, and New conversation works. The user also separately performed a local,
+read-only SQLite inspection and confirmed the exact `BLANK STARTUP TEST OK`
+test exchange remained stored: the user and assistant messages were under the
+same conversation ID and the expected assistant response was present. No
+conversation UUID or database contents were displayed or recorded here.
+
+Blank startup changes which conversation opens; it does not delete saved history.
+Conversation browsing/reopening remains unavailable through the UI. Browser
+refresh is not an acknowledged cancellation. No automated frontend tests were
+added; build/lint and the reported manual acceptance are the validation basis.
+
+Local checks for this checkpoint:
+
+- `npm.cmd --prefix frontend run build` - passed. Vite emitted a nonfatal
+  warning for the 579.38 kB minified JavaScript chunk.
+- `npm.cmd --prefix frontend run lint` - passed.
+- `git diff --check` - passed.
+
+No automated frontend tests were added. The checks above and the user-reported
+manual browser acceptance are the validation basis; no live tests were repeated
+for this checkpoint.

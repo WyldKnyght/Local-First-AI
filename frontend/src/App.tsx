@@ -60,7 +60,14 @@ type PendingExchange = {
   assistant: PendingMessage;
   status: "streaming" | "stopping" | "unknown" | "failed" | "confirmed" | "cancelled";
 };
-const CONVERSATION_KEY = "local-first-ai.conversation-id";
+let initialConversationRequest: Promise<Created> | null = null;
+
+function requestInitialConversation(): Promise<Created> {
+  if (initialConversationRequest === null) {
+    initialConversationRequest = api<Created>("/conversations", { method: "POST" });
+  }
+  return initialConversationRequest;
+}
 
 async function responseError(response: Response): Promise<Error> {
   let detail = `Request failed (${response.status}).`;
@@ -661,13 +668,8 @@ export default function App() {
     let active = true;
     async function initialize() {
       try {
-        let id = localStorage.getItem(CONVERSATION_KEY);
-        if (!id) {
-          const created = await api<Created>("/conversations", { method: "POST" });
-          id = created.conversation_id;
-          localStorage.setItem(CONVERSATION_KEY, id);
-        }
-        if (active) setConversationId(id);
+        const created = await requestInitialConversation();
+        if (active) setConversationId(created.conversation_id);
       } catch (problem) {
         if (active) { setError(errorText(problem)); setBusy(false); }
       }
@@ -682,7 +684,6 @@ export default function App() {
     setError("");
     try {
       const created = await api<Created>("/conversations", { method: "POST" });
-      localStorage.setItem(CONVERSATION_KEY, created.conversation_id);
       setConversationId(created.conversation_id);
     } catch (problem) { setError(errorText(problem)); setBusy(false); }
     finally { creating.current = false; }
