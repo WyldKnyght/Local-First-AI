@@ -245,9 +245,9 @@ Local validation on 2026-10-28:
   - passed.
 - `git diff --check` - passed.
 
-These are local build, lint, isolated test, compilation, and whitespace checks.
-They do not constitute a live-browser retest of the terminal SSE correction;
-live retesting remains outstanding.
+These local build, lint, isolated test, compilation, and whitespace checks were
+not a live-browser retest performed by the implementer. The user-reported
+post-correction browser acceptance is recorded in the following section.
 
 ## Explicit cancellation validation - 2026-10-28
 
